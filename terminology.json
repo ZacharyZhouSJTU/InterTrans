@@ -1,0 +1,12 @@
+{
+  "LLM": "大语言模型",
+  "RAG": "检索增强生成",
+  "API": "应用程序接口",
+  "NLP": "自然语言处理",
+  "fine-tuning": "微调",
+  "prompt": "提示词",
+  "token": "词元",
+  "embedding": "嵌入向量",
+  "inference": "推理",
+  "hallucination": "幻觉"
+}
