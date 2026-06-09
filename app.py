@@ -2,19 +2,244 @@
 
 import io
 import csv
+import inspect
 import streamlit as st
 from translator import translate, PROVIDER_LABELS, DIRECTION_LABELS
 from config import DEFAULT_PROVIDER
-from database import init_db, get_prompt_override, save_prompt_override, delete_prompt_override, get_all_prompt_overrides
+from database import init_db
 from tracker import record_modification, confirm_rule, ignore_rule, defer_rule
 from document import parse_uploaded_file, filter_chinese_only, filter_english_only
-from prompt_center import (
-    STYLE_LABELS, STYLE_CONFIGS,
-    get_default_prompt_text, get_effective_principles,
+from term_manager import (
+    detect_domains, load_terminology,
+    get_terms_for_domain, match_terms,
+    build_domain_prompt, DOMAIN_KEYWORDS, DOMAIN_TONES,
 )
 
 st.set_page_config(page_title="翻译记忆学习系统", page_icon="🌐", layout="wide")
 init_db()
+
+
+# ═══════════════════════════════════════════════════════
+# 术语注入辅助函数
+# 目的：把 Tab3 数据库术语 + term_manager 静态术语统一用于 Tab1 翻译
+# ═══════════════════════════════════════════════════════
+DOMAIN_ALIASES = {
+    "医学": "医疗",
+    "经济金融": "金融",
+}
+DOC_DOMAIN_OPTIONS = [
+    "自动检测", "信息技术", "医疗", "法律", "金融", "经济金融",
+    "传统文化", "政治外交", "化学化工", "教育", "医学", "其他",
+]
+MAX_PROMPT_TERMS = 40
+
+
+def normalize_domain(domain: str | None) -> str:
+    """统一页面领域名和术语库领域名，例如：医学→医疗，经济金融→金融。"""
+    d = (domain or "其他").strip() or "其他"
+    return DOMAIN_ALIASES.get(d, d)
+
+
+def dedupe_terms(terms: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """术语去重，保留首次出现顺序。"""
+    seen: set[tuple[str, str]] = set()
+    result: list[tuple[str, str]] = []
+    for ch, en in terms:
+        ch = (ch or "").strip()
+        en = (en or "").strip()
+        if not ch or not en:
+            continue
+        key = (ch.lower(), en.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((ch, en))
+    return result
+
+
+def load_db_terminology() -> dict[str, list[tuple[str, str]]]:
+    """读取 Tab3 页面导入/保存到数据库中的术语。"""
+    try:
+        from database import get_all_assets
+        try:
+            assets = get_all_assets(domain=None, keyword=None)
+        except TypeError:
+            assets = get_all_assets()
+    except Exception:
+        return {}
+
+    terminology: dict[str, list[tuple[str, str]]] = {}
+    for a in assets or []:
+        # get_all_assets 通常返回 sqlite Row / dict，二者都兼容
+        try:
+            source = (a.get("source_text") or "").strip()
+            target = (a.get("target_text") or "").strip()
+            domain = normalize_domain(a.get("domain") or "其他")
+        except AttributeError:
+            source = (a["source_text"] or "").strip()
+            target = (a["target_text"] or "").strip()
+            domain = normalize_domain(a["domain"] or "其他")
+
+        if not source or not target:
+            continue
+        terminology.setdefault(domain, []).append((source, target))
+    return {d: dedupe_terms(ts) for d, ts in terminology.items()}
+
+
+def merge_terminology_dicts(*items: dict[str, list[tuple[str, str]]]) -> dict[str, list[tuple[str, str]]]:
+    """合并静态 CSV 术语和数据库术语。"""
+    merged: dict[str, list[tuple[str, str]]] = {}
+    for terminology in items:
+        for domain, terms in (terminology or {}).items():
+            nd = normalize_domain(domain)
+            merged.setdefault(nd, []).extend(terms or [])
+    return {d: dedupe_terms(ts) for d, ts in merged.items()}
+
+
+def load_app_terminology() -> dict[str, list[tuple[str, str]]]:
+    """
+    页面实际使用的术语库：
+    1. term_manager.load_terminology() 读取的静态 CSV；
+    2. Tab3 导入/人工保存后进入数据库的动态术语。
+    """
+    try:
+        csv_terms = load_terminology() or {}
+    except Exception:
+        csv_terms = {}
+    db_terms = load_db_terminology()
+    return merge_terminology_dicts(csv_terms, db_terms)
+
+
+def flatten_terminology(terminology: dict[str, list[tuple[str, str]]]) -> list[tuple[str, str]]:
+    terms: list[tuple[str, str]] = []
+    for values in terminology.values():
+        terms.extend(values or [])
+    return dedupe_terms(terms)
+
+
+def build_term_context(text: str, selected_domain: str | None) -> dict:
+    """对单句/段落做领域检测、术语筛选、术语匹配，并生成真正要传给模型的 prompt。"""
+    terminology = load_app_terminology()
+    detected = detect_domains(text, DOMAIN_KEYWORDS)
+
+    selected = normalize_domain(selected_domain)
+    detected_domains = [normalize_domain(d) for d, _ in detected]
+
+    if selected_domain and selected_domain != "自动检测" and selected != "其他":
+        best_domain = selected
+    elif detected_domains:
+        best_domain = detected_domains[0]
+    else:
+        best_domain = "其他"
+
+    active_domains: list[str] = []
+    if best_domain != "其他":
+        active_domains.append(best_domain)
+    active_domains.extend(detected_domains)
+    active_domains.append("其他")
+
+    # 去重并只保留术语库中存在的领域；如果完全检测不到，就退回全库匹配
+    active_domains = list(dict.fromkeys(active_domains))
+    active_terms: list[tuple[str, str]] = []
+    for d in active_domains:
+        active_terms.extend(get_terms_for_domain(d, terminology))
+    active_terms = dedupe_terms(active_terms)
+
+    if not active_terms:
+        active_terms = flatten_terminology(terminology)
+
+    matched_terms: list[tuple[str, str]] = []
+    match_positions = []
+    if active_terms:
+        matched_terms, match_positions = match_terms(text, active_terms)
+        matched_terms = dedupe_terms(matched_terms)
+
+    # 如果用户选了某个领域但没有命中，尝试全库兜底，避免术语领域写错时完全失效
+    if not matched_terms:
+        all_terms = flatten_terminology(terminology)
+        if all_terms:
+            matched_terms, match_positions = match_terms(text, all_terms)
+            matched_terms = dedupe_terms(matched_terms)
+
+    matched_terms = matched_terms[:MAX_PROMPT_TERMS]
+    system_prompt = build_domain_prompt(
+        text=text,
+        domain=best_domain if best_domain != "其他" else None,
+        matched_terms=matched_terms if matched_terms else None,
+    )
+
+    return {
+        "domain": best_domain,
+        "selected_domain": selected_domain or "自动检测",
+        "detected": detected,
+        "active_domains": active_domains,
+        "matched_terms": matched_terms,
+        "match_positions": match_positions,
+        "system_prompt": system_prompt,
+        "term_total": sum(len(v) for v in terminology.values()),
+    }
+
+
+
+
+def resolve_asset_domain_for_save(source_text: str) -> str:
+    """保存人工修订到术语/记忆库时，避免把领域写成“自动检测”。"""
+    selected = st.session_state.get("app_domain", "自动检测")
+    if selected and selected != "自动检测":
+        return normalize_domain(selected)
+    detected = detect_domains(source_text or "", DOMAIN_KEYWORDS)
+    if detected:
+        return normalize_domain(detected[0][0])
+    return "其他"
+
+def translate_with_term_context(text: str, *, provider: str, direction: str, selected_domain: str):
+    """
+    包装原 translate()：
+    - 先匹配术语并生成 system_prompt；
+    - 如果 translator.translate 支持 system_prompt/matched_terms/domain 参数，就传入；
+    - 如果暂不支持，则退回原调用，并在 retrieval 中标记 translator_needs_patch=True。
+    """
+    term_context = build_term_context(text, selected_domain)
+
+    base_kwargs = {"provider": provider, "direction": direction}
+    context_kwargs = {
+        "domain": term_context["domain"],
+        "matched_terms": term_context["matched_terms"],
+        "terminology": term_context["matched_terms"],
+        "system_prompt": term_context["system_prompt"],
+        "term_prompt": term_context["system_prompt"],
+    }
+
+    try:
+        sig = inspect.signature(translate)
+        params = sig.parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        supported_context_kwargs = {
+            k: v for k, v in context_kwargs.items()
+            if accepts_kwargs or k in params
+        }
+    except Exception:
+        supported_context_kwargs = {}
+
+    used_term_prompt = bool(supported_context_kwargs)
+    try:
+        translation, retrieval = translate(text, **base_kwargs, **supported_context_kwargs)
+    except TypeError:
+        # 兼容旧版 translator.translate(text, provider, direction)
+        used_term_prompt = False
+        translation, retrieval = translate(text, **base_kwargs)
+
+    retrieval = retrieval or {}
+    retrieval.setdefault("domain", term_context["domain"])
+    retrieval.setdefault("hits", [])
+    retrieval.setdefault("count", len(retrieval.get("hits", [])))
+    retrieval["matched_terms"] = term_context["matched_terms"]
+    retrieval["term_prompt"] = term_context["system_prompt"]
+    retrieval["term_total"] = term_context["term_total"]
+    retrieval["used_term_prompt"] = used_term_prompt
+    retrieval["translator_needs_patch"] = not used_term_prompt
+    return translation, retrieval
+
 
 # ── Session State ────────────────────────────────────
 if "style_prompt" not in st.session_state:
@@ -32,13 +257,11 @@ if "doc_edits" not in st.session_state:
 if "doc_editing" not in st.session_state:
     st.session_state.doc_editing = False
 if "app_domain" not in st.session_state:
-    st.session_state.app_domain = "其他"
-if "prompt_template" not in st.session_state:
-    st.session_state.prompt_template = "default"
-if "custom_prompt_text" not in st.session_state:
-    st.session_state.custom_prompt_text = ""
+    st.session_state.app_domain = "自动检测"
 if "last_retrieval" not in st.session_state:
     st.session_state.last_retrieval = None
+if "last_term_context" not in st.session_state:
+    st.session_state.last_term_context = None
 
 # ── 侧边栏 ────────────────────────────────────────────
 with st.sidebar:
@@ -51,24 +274,10 @@ with st.sidebar:
     )
     st.session_state.provider = provider
 
-    st.divider()
-    from prompt_center import PROMPT_LABELS
-    st.session_state.prompt_template = st.selectbox(
-        "Prompt",
-        options=list(PROMPT_LABELS.keys()),
-        format_func=lambda k: PROMPT_LABELS[k],
-        key="prompt_sidebar",
-    )
-    if st.session_state.prompt_template == "custom":
-        st.session_state.custom_prompt_text = st.text_area(
-            "自定义", value=st.session_state.custom_prompt_text or "",
-            height=100, label_visibility="collapsed",
-        )
-
 # ── 主界面 ────────────────────────────────────────────
 st.title("🌐 翻译记忆学习系统")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📄 文档翻译", "📁 我的文件", "📚 记忆库", "🎨 Prompt"])
+tab1, tab2, tab3, tab4 = st.tabs(["📄 文档翻译", "📁 我的文件", "📚 术语库", "🔬 领域术语"])
 
 # ═══════════════════════════════════════════════════════
 #  Tab 1：文档翻译
@@ -117,7 +326,10 @@ with tab1:
                 )
             with col_dom:
                 st.session_state.app_domain = st.selectbox(
-                    "Domain", options=["经济金融", "传统文化", "政治外交", "化学化工", "教育", "法律", "医学", "其他"], key="doc_domain",
+                    "Domain / 术语领域",
+                    options=DOC_DOMAIN_OPTIONS,
+                    key="doc_domain",
+                    help="建议选择「自动检测」；如果自动识别不准，可手动指定领域。",
                 )
             with col_btn:
                 st.write(""); st.write("")
@@ -126,35 +338,71 @@ with tab1:
             if translate_all_clicked:
                 st.session_state.doc_translations = {}
                 st.session_state.last_retrieval = None
+                st.session_state.last_term_context = None
                 progress_bar = st.progress(0)
                 total = len(display_segments)
+                term_used_count = 0
+                term_matched_total = 0
+                needs_translator_patch = False
+
                 for i, seg in enumerate(display_segments):
                     try:
-                        translation, retrieval = translate(
-                            seg["source_text"], provider=st.session_state.provider,
+                        translation, retrieval = translate_with_term_context(
+                            seg["source_text"],
+                            provider=st.session_state.provider,
                             direction=st.session_state.doc_direction,
-                            prompt_template=st.session_state.prompt_template,
-                            custom_prompt=st.session_state.custom_prompt_text,
+                            selected_domain=st.session_state.app_domain,
                         )
                         st.session_state.doc_translations[seg["sentence_id"]] = translation
                         if retrieval:
                             st.session_state.last_retrieval = retrieval
+                            st.session_state.last_term_context = retrieval
+                            term_matched_total += len(retrieval.get("matched_terms", []))
+                            if retrieval.get("used_term_prompt"):
+                                term_used_count += 1
+                            if retrieval.get("translator_needs_patch"):
+                                needs_translator_patch = True
                     except Exception as e:
                         st.session_state.doc_translations[seg["sentence_id"]] = f"❌ {e}"
                     progress_bar.progress((i + 1) / total)
-                st.success(f"翻译完成！共 {total} 句")
 
-            # ── 检索结果展示 ────────────────────────────
+                if needs_translator_patch:
+                    st.warning(
+                        "已完成术语匹配，但当前 translator.translate() 不接收 system_prompt/matched_terms 参数，"
+                        "术语可能没有真正进入模型。请同步修改 translator.py 的 translate() 函数签名和 Prompt 拼接逻辑。"
+                    )
+                else:
+                    st.success(f"翻译完成！共 {total} 句；术语 Prompt 已注入 {term_used_count} 句，累计匹配 {term_matched_total} 个术语。")
+
+            # ── 检索结果 / 术语注入展示 ────────────────────────────
             if st.session_state.get("last_retrieval"):
                 r = st.session_state.last_retrieval
+                domain = r.get("domain", "未知")
+                matched_terms = r.get("matched_terms", [])
+                used_label = "已注入模型" if r.get("used_term_prompt") else "仅匹配，未注入"
                 with st.expander(
                     f"🔍 本次翻译使用 · 模型：{PROVIDER_LABELS[st.session_state.provider]} · "
-                    f"Prompt：{st.session_state.prompt_template} · "
-                    f"记忆库命中：{r['count']}",
+                    f"领域：{domain} · "
+                    f"术语匹配：{len(matched_terms)} 个 · {used_label}",
                     expanded=False,
                 ):
-                    for h in r["hits"]:
-                        st.caption(f"{h['source_text']} → {h['target_text']}")
+                    st.caption(f"当前可用术语总量：{r.get('term_total', 0)}")
+                    if r.get("translator_needs_patch"):
+                        st.warning(
+                            "translator.translate() 目前没有接收 system_prompt/matched_terms，"
+                            "因此页面能匹配术语，但模型未必按术语表翻译。"
+                        )
+                    if matched_terms:
+                        st.markdown("**📋 匹配术语**")
+                        for ch, en in matched_terms:
+                            st.caption(f"{ch} → {en}")
+                    if r.get("term_prompt"):
+                        with st.expander("查看本句传入模型的术语 Prompt", expanded=False):
+                            st.code(r["term_prompt"], language="markdown")
+                    if r.get("hits"):
+                        st.markdown("**📖 TM 命中**")
+                        for h in r["hits"]:
+                            st.caption(f"{h['source_text']} → {h['target_text']}")
 
             # 修改模式切换
             if st.session_state.doc_translations:
@@ -199,9 +447,9 @@ with tab1:
                                     if result["should_prompt"]:
                                         st.session_state.style_prompt = {"rule_id": result["rule_id"], "original": result["original_phrase"], "modified": result["modified_phrase"], "count": result["count"], "status": result["status"]}
                                     from database import insert_asset
-                                    insert_asset(source=seg["source_text"], target=modified, domain=st.session_state.app_domain)
+                                    insert_asset(source=seg["source_text"], target=modified, domain=resolve_asset_domain_for_save(seg["source_text"]))
                                 st.session_state[f"saved_{sid}"] = True
-                                st.success(f"{sid} 已保存 → Memory Base")
+                                st.success(f"{sid} 已保存 → 术语库")
                                 st.rerun()
 
                 col_save_all, _ = st.columns([1, 3])
@@ -217,13 +465,13 @@ with tab1:
                                 result = record_modification(source=seg["source_text"], original=original, modified=modified)
                                 if result["should_prompt"]:
                                     last_prompt = {"rule_id": result["rule_id"], "original": result["original_phrase"], "modified": result["modified_phrase"], "count": result["count"], "status": result["status"]}
-                                insert_asset(source=seg["source_text"], target=modified, domain=st.session_state.app_domain)
+                                insert_asset(source=seg["source_text"], target=modified, domain=resolve_asset_domain_for_save(seg["source_text"]))
                             st.session_state[f"saved_{sid}"] = True
                             saved_count += 1
                         st.session_state.doc_editing = False
                         if last_prompt:
                             st.session_state.style_prompt = last_prompt
-                        st.success(f"已保存 {saved_count} 条 → Memory Base")
+                        st.success(f"已保存 {saved_count} 条 → 术语库")
                         st.rerun()
 
             # 表格
@@ -303,201 +551,344 @@ with tab2:
         st.info("暂无上传记录")
 
 # ═══════════════════════════════════════════════════════
-#  Tab 3：记忆库
+#  Tab 3：术语库
 # ═══════════════════════════════════════════════════════
 with tab3:
-    from database import get_all_assets, get_asset_stats, delete_asset, insert_asset
+    from database import get_all_assets, get_asset_stats, get_asset_domains, delete_asset, insert_asset
 
+    DOMAIN_OPTIONS = ["医疗", "法律", "信息技术", "金融", "经济金融", "传统文化", "政治外交", "化学化工", "教育", "其他"]
+
+    def auto_detect_columns(headers: list[str], sample_rows: list[list[str]]) -> dict:
+        """
+        自动识别 CSV 列的中文/英文/领域归属。
+        返回 {'zh_col': str, 'en_col': str, 'domain_col': str|None}
+        """
+        import re
+
+        zh_pattern = re.compile(r"[一-鿿]")
+        en_pattern = re.compile(r"^[a-zA-Z0-9\s\-_.,;:!?()/&+\"'<>\[\]{}|~@#$%^*=]+$")
+
+        col_data = {h: [] for h in headers}
+        for row in sample_rows:
+            for i, h in enumerate(headers):
+                if i < len(row):
+                    col_data[h].append(str(row[i]) if row[i] is not None else "")
+
+        scores = {}
+        for h, vals in col_data.items():
+            non_empty = [v for v in vals if v.strip()]
+            if not non_empty:
+                scores[h] = {"zh": 0, "en": 0, "domain_hint": 0}
+                continue
+            zh_count = sum(1 for v in non_empty if zh_pattern.search(v))
+            en_count = sum(1 for v in non_empty if en_pattern.match(v.strip()))
+            zh_ratio = zh_count / len(non_empty)
+            en_ratio = en_count / len(non_empty)
+            hl = h.lower()
+            domain_hint = 1 if any(kw in hl for kw in ["领域", "domain", "field", "category", "行业", "分类", "类型"]) else 0
+            scores[h] = {"zh": zh_ratio, "en": en_ratio, "domain_hint": domain_hint}
+
+        zh_candidates = sorted(
+            [(h, s) for h, s in scores.items() if s["zh"] >= 0.3],
+            key=lambda x: x[1]["zh"], reverse=True,
+        )
+        zh_col = zh_candidates[0][0] if zh_candidates else headers[0] if headers else ""
+
+        en_candidates = sorted(
+            [(h, s) for h, s in scores.items() if s["en"] >= 0.3 and h != zh_col],
+            key=lambda x: x[1]["en"], reverse=True,
+        )
+        en_col = en_candidates[0][0] if en_candidates else (headers[1] if len(headers) > 1 else "")
+
+        domain_col = None
+        domain_candidates = sorted(
+            [(h, s) for h, s in scores.items() if h != zh_col and h != en_col],
+            key=lambda x: (-x[1]["domain_hint"], x[1]["zh"] + x[1]["en"]),
+        )
+        if domain_candidates:
+            best = domain_candidates[0]
+            domain_col = best[0]
+
+        return {"zh_col": zh_col, "en_col": en_col, "domain_col": domain_col}
+
+    # ── 统计 ──
     stats = get_asset_stats()
-    m1, m2 = st.columns(2)
-    with m1: st.metric("📊 Total Assets", stats["total"])
-    with m2: st.metric("✅ Active", stats.get("active", stats["total"]))
+    m1, m2, m3 = st.columns(3)
+    with m1: st.metric("📊 术语总数", stats["total"])
+    with m2: st.metric("✅ 启用", stats.get("active", stats["total"]))
+    with m3: st.metric("📂 领域数", len(get_asset_domains()) if stats["total"] > 0 else 0)
 
-    # Import
-    with st.expander("📥 Import Excel / CSV", expanded=False):
-        imp_file = st.file_uploader("上传", type=["xlsx", "csv"], key="mb_import_file", label_visibility="collapsed")
-        if imp_file and st.button("📥 开始导入", type="primary", use_container_width=True):
+    # ── 上传 CSV ──
+    with st.expander("📥 上传术语 CSV", expanded=False):
+        st.caption("CSV 文件将自动识别中文列、英文列和领域列")
+        imp_file = st.file_uploader(
+            "选择 CSV 文件", type=["csv"], key="term_import_file",
+            label_visibility="collapsed",
+        )
+        if imp_file is not None:
+            raw_bytes = imp_file.read()
+            imp_file.seek(0)
             try:
-                fn = imp_file.name.lower()
-                if fn.endswith(".csv"):
-                    rows = list(csv.DictReader(io.StringIO(imp_file.read().decode("utf-8-sig"))))
-                elif fn.endswith(".xlsx"):
-                    from openpyxl import load_workbook
-                    wb = load_workbook(imp_file, read_only=True); ws = wb.active
-                    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-                    rows = [dict(zip(headers, r)) for r in ws.iter_rows(min_row=2, values_only=True)]
-                    wb.close()
-                else:
-                    st.error("不支持的文件格式"); rows = []
-                if rows:
-                    missing = {"source_text", "target_text"} - set(rows[0].keys())
-                    if missing:
-                        st.error(f"❌ 缺少必须字段：{', '.join(missing)}")
-                    else:
-                        imported = skipped = 0
-                        for r in rows:
-                            src = (r.get("source_text") or "").strip()
-                            tgt = (r.get("target_text") or "").strip()
-                            if not src or not tgt: skipped += 1; continue
-                            insert_asset(source=src, target=tgt, domain=(r.get("domain") or "其他").strip())
-                            imported += 1
-                        st.success(f"✅ 导入 {imported} 条" + (f"，跳过 {skipped} 条" if skipped else "")); st.rerun()
-            except Exception as e:
-                st.error(f"导入失败：{e}")
+                content = raw_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                content = raw_bytes.decode("gbk", errors="replace")
 
-    # Search + filters
-    c1, c2, c3 = st.columns(3)
-    with c1: keyword = st.text_input("🔍 搜索", key="mb_search")
-    with c2: domain_filter = st.selectbox("Domain", options=["全部", "经济金融", "传统文化", "政治外交", "化学化工", "教育", "法律", "医学", "其他"], key="mb_domain")
-    with c3: status_filter = st.selectbox("Status", options=["全部", "active", "draft", "archived"], key="mb_status")
+            reader = csv.reader(io.StringIO(content))
+            rows_list = list(reader)
+            if len(rows_list) < 2:
+                st.warning("CSV 至少需要表头 + 1 行数据")
+            else:
+                headers = rows_list[0]
+                sample_rows = rows_list[1:6]
+                all_rows = rows_list[1:]
+
+                detected = auto_detect_columns(headers, sample_rows)
+
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    st.success(f"🇨🇳 中文列 → **{detected['zh_col']}**")
+                with col_b:
+                    st.success(f"🇬🇧 英文列 → **{detected['en_col']}**")
+                with col_c:
+                    if detected["domain_col"]:
+                        st.info(f"🏷 领域列 → **{detected['domain_col']}**")
+                    else:
+                        st.caption("未检测到领域列，默认使用「其他」")
+
+                st.markdown("**📋 预览（前 5 条）**")
+                zh_idx = headers.index(detected["zh_col"]) if detected["zh_col"] in headers else 0
+                en_idx = headers.index(detected["en_col"]) if detected["en_col"] in headers else (1 if len(headers) > 1 else 0)
+                domain_idx = headers.index(detected["domain_col"]) if detected.get("domain_col") and detected["domain_col"] in headers else None
+
+                preview_rows = []
+                for row in all_rows[:5]:
+                    zh_val = row[zh_idx].strip() if zh_idx < len(row) else ""
+                    en_val = row[en_idx].strip() if en_idx < len(row) else ""
+                    domain_val = row[domain_idx].strip() if domain_idx is not None and domain_idx < len(row) else "其他"
+                    preview_rows.append((zh_val, en_val, domain_val))
+
+                preview_html = (
+                    "<table style='width:100%;border-collapse:collapse;font-size:14px;'>"
+                    "<tr style='background:#e0e0e0;'><th style='padding:8px;text-align:left;'>中文</th><th style='padding:8px;text-align:left;'>英文</th><th style='padding:8px;text-align:left;'>领域</th></tr>"
+                    + "".join(
+                        f"<tr><td style='padding:8px;border-bottom:1px solid #eee;'>{zh}</td><td style='padding:8px;border-bottom:1px solid #eee;'>{en}</td><td style='padding:8px;border-bottom:1px solid #eee;'>{dom}</td></tr>"
+                        for zh, en, dom in preview_rows
+                    )
+                    + "</table>"
+                )
+                st.markdown(preview_html, unsafe_allow_html=True)
+
+                if st.button("📥 确认导入", type="primary", use_container_width=True, key="term_confirm_import"):
+                    imported = skipped = 0
+                    for row in all_rows:
+                        zh_val = (row[zh_idx].strip() if zh_idx < len(row) else "")
+                        en_val = (row[en_idx].strip() if en_idx < len(row) else "")
+                        domain_val = (row[domain_idx].strip() if domain_idx is not None and domain_idx < len(row) else "其他")
+                        if not zh_val or not en_val:
+                            skipped += 1
+                            continue
+                        insert_asset(source=zh_val, target=en_val, domain=domain_val if domain_val else "其他")
+                        imported += 1
+
+                    msg = f"✅ 导入 {imported} 条术语"
+                    if skipped:
+                        msg += f"，跳过 {skipped} 条空行"
+                    st.success(msg)
+                    st.rerun()
+
+    # ── 搜索 + 领域筛选 ──
+    st.divider()
+
+    existing_domains = get_asset_domains()
+    domain_options = ["全部"] + [d for d in DOMAIN_OPTIONS if d in existing_domains] + [d for d in existing_domains if d not in DOMAIN_OPTIONS]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        keyword = st.text_input("🔍 搜索术语", key="term_search", placeholder="输入中文或英文关键词...")
+    with c2:
+        domain_filter = st.selectbox("🏷 领域筛选", options=domain_options, key="term_domain")
 
     assets = get_all_assets(
         domain=None if domain_filter == "全部" else domain_filter,
-        status=None if status_filter == "全部" else status_filter,
         keyword=keyword.strip() or None,
     )
 
-    selected_indices = []
-    if "mb_selected_rows" in st.session_state:
-        sel = st.session_state.mb_selected_rows
-        if isinstance(sel, dict) and "selection" in sel:
-            selected_indices = sel["selection"].get("rows", [])
-        elif hasattr(sel, "selection") and hasattr(sel.selection, "rows"):
-            selected_indices = sel.selection.rows
+    st.markdown(f"**共 {len(assets)} 条术语**" + (f"（总计 {stats['total']} 条）" if keyword or domain_filter != "全部" else ""))
 
-    ci, cd = st.columns([4, 1])
-    with ci: st.markdown(f"**共 {len(assets)} 条**（总计 {stats['total']} 条）")
-    with cd:
-        if assets and selected_indices:
-            if st.button(f"🗑 删除 ({len(selected_indices)})", type="secondary", use_container_width=True):
-                for idx in selected_indices: delete_asset(assets[idx]["id"])
-                st.session_state.mb_selected_rows = {}
-                st.success(f"已删除 {len(selected_indices)} 条"); st.rerun()
-
+    # ── 术语表格 ──
     if not assets:
-        st.info("🙅 No Assets Found.")
+        st.info("🙅 暂无术语。请上传 CSV 文件导入术语库。")
     else:
-        import pandas as pd
-        df = pd.DataFrame([{"ID": a["id"], "Source Text": a["source_text"], "Target Text": a["target_text"], "Domain": a["domain"], "Status": a["status"], "Updated Time": a["updated_time"]} for a in assets])
-        st.dataframe(df, use_container_width=True, height=550, hide_index=True, selection_mode="multi-row", on_select="rerun", key="mb_selected_rows")
+        table_html = (
+            "<div style='max-height:550px;overflow-y:auto;border:1px solid #ddd;border-radius:8px;'>"
+            "<table style='width:100%;border-collapse:collapse;font-size:14px;'>"
+            "<thead><tr style='position:sticky;top:0;background:#e0e0e0;'>"
+            "<th style='padding:10px;text-align:left;'>🇨🇳 中文</th>"
+            "<th style='padding:10px;text-align:left;'>🇬🇧 英文</th>"
+            "<th style='padding:10px;text-align:left;width:100px;'>🏷 领域</th>"
+            "<th style='padding:10px;text-align:center;width:60px;'>操作</th>"
+            "</tr></thead><tbody>"
+            + "".join(
+                f"<tr style='border-bottom:1px solid #eee;'>"
+                f"<td style='padding:8px;vertical-align:top;'>{a['source_text']}</td>"
+                f"<td style='padding:8px;vertical-align:top;'>{a['target_text']}</td>"
+                f"<td style='padding:8px;vertical-align:top;white-space:nowrap;'>{a['domain']}</td>"
+                f"<td style='padding:8px;text-align:center;vertical-align:top;'>"
+                f"</td>"
+                f"</tr>"
+                for a in assets
+            )
+            + "</tbody></table></div>"
+        )
+        st.markdown(table_html, unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════
-#  Tab 4：Prompt 管理
-# ═══════════════════════════════════════════════════════
-with tab4:
-    st.subheader("🎨 Prompt 管理")
-
-    st.markdown("选择领域 / 风格，查看和编辑对应的提示词。保存后将**持久生效**，用于所有翻译。")
-
-    # ── 选择领域 ────────────────────────────────────────
-    col_sel, col_act = st.columns([2, 1])
-    with col_sel:
-        selected_style = st.selectbox(
-            "选择领域 / 风格",
-            options=list(STYLE_LABELS.keys()),
-            format_func=lambda k: STYLE_LABELS[k],
-            key="prompt_mgmt_style",
+        # ── CSV 导出 ──
+        csv_buffer = io.StringIO(newline="")
+        writer = csv.writer(csv_buffer, quoting=csv.QUOTE_ALL)
+        writer.writerow(["中文", "英文", "领域"])
+        for a in assets:
+            writer.writerow([a["source_text"], a["target_text"], a["domain"]])
+        csv_bytes = csv_buffer.getvalue().encode("utf-8-sig")
+        import base64
+        st.markdown(
+            f'<a href="data:text/csv;charset=utf-8;base64,{base64.b64encode(csv_bytes).decode()}" '
+            f'download="terminology.csv" '
+            f'style="display:inline-block;padding:6px 16px;background:#4CAF50;color:#fff;'
+            f'text-decoration:none;border-radius:6px;font-size:14px;">📥 下载术语 CSV</a>',
+            unsafe_allow_html=True,
         )
 
-    config = STYLE_CONFIGS.get(selected_style, STYLE_CONFIGS["default"])
+        # 批量删除
+        st.divider()
+        st.markdown("### 🗑 删除术语")
 
-    # ── 显示当前生效的提示词 ────────────────────────────
-    st.divider()
+        delete_options = {f"#{a['id']} | {a['source_text']} → {a['target_text']}": a["id"] for a in assets}
+        selected_labels = st.multiselect(
+            "选择要删除的术语（可多选）",
+            options=list(delete_options.keys()),
+            key="term_delete_select",
+        )
 
-    # 获取默认提示词文本和用户覆写
-    default_text = get_default_prompt_text(selected_style)
-    saved_override = get_prompt_override(selected_style)
+        col_del, _ = st.columns([1, 3])
+        with col_del:
+            if selected_labels:
+                if st.button(f"🗑 删除选中 ({len(selected_labels)})", type="secondary", use_container_width=True):
+                    for label in selected_labels:
+                        delete_asset(delete_options[label])
+                    st.success(f"已删除 {len(selected_labels)} 条术语")
+                    st.rerun()
 
-    # 当前实际使用的原则
-    current_principles = get_effective_principles(selected_style)
-    has_override = saved_override is not None
+# ═══════════════════════════════════════════════════════
+#  Tab 4：领域术语 — 领域检测 + 术语标注 + Prompt 预览
+# ═══════════════════════════════════════════════════════
+with tab4:
+    st.subheader("🔬 领域术语 — 自动检测 + 术语标注 + Prompt 生成")
 
-    if has_override:
-        st.success(f"✅ **{STYLE_LABELS[selected_style]}** — 当前使用自定义提示词")
-    else:
-        st.info(f"📋 **{STYLE_LABELS[selected_style]}** — 当前使用默认提示词")
-
-    # ── 提示词展示 / 编辑区 ─────────────────────────────
-    st.markdown("### ✏️ 翻译原则")
-
-    # 编辑内容：优先展示用户覆写，否则展示默认
-    if has_override:
-        edit_text = saved_override
-    else:
-        # 将默认原则格式化为可编辑文本
-        edit_text = "\n".join(config.get("principles", []))
-
-    edited_principles = st.text_area(
-        "翻译原则（每行一条）",
-        value=edit_text,
-        height=250,
-        key="prompt_mgmt_editor",
-        help="每行一条翻译原则。保存后将覆盖默认设置，用于该领域的所有翻译。",
+    # ── 输入测试文本 ──
+    test_text = st.text_area(
+        "输入文本进行领域检测和术语匹配",
+        placeholder="在此粘贴需要分析的中文或英文文本...",
+        height=150,
+        key="term_test_text",
     )
 
-    # ── 操作按钮 ────────────────────────────────────────
-    col_save, col_reset, col_preview = st.columns([1, 1, 2])
+    if test_text.strip():
+        # ── 领域检测 ──
+        detected = detect_domains(test_text, DOMAIN_KEYWORDS)
 
-    with col_save:
-        if st.button("💾 保存提示词", type="primary", use_container_width=True, key="prompt_mgmt_save"):
-            trimmed = edited_principles.strip()
-            if trimmed:
-                save_prompt_override(selected_style, trimmed)
-                st.success(f"✅ **{STYLE_LABELS[selected_style]}** 提示词已保存！")
-                st.rerun()
-            else:
-                st.error("提示词不能为空")
+        st.divider()
+        st.markdown("### 🎯 领域检测")
 
-    with col_reset:
-        if has_override:
-            if st.button("🔄 恢复默认", use_container_width=True, key="prompt_mgmt_reset"):
-                delete_prompt_override(selected_style)
-                st.success(f"🔄 **{STYLE_LABELS[selected_style]}** 已恢复默认提示词")
-                st.rerun()
+        if not detected:
+            st.info("未能自动判断领域，将尝试匹配全部术语库")
+            best_domain = "其他"
+            active_domains = list(DOMAIN_KEYWORDS.keys())
         else:
-            st.button("🔄 恢复默认", disabled=True, use_container_width=True, key="prompt_mgmt_reset_disabled")
+            best_domain = detected[0][0]
+            active_domains = [d for d, _ in detected]
 
-    # ── 预览区 ──────────────────────────────────────────
-    st.divider()
-    st.markdown("### 🔍 最终 System Prompt 预览")
-    st.caption("以下是该风格在翻译时实际组装出的 System Prompt 结构：")
+            # 显示各领域得分
+            cols = st.columns(len(detected))
+            for i, (domain, score) in enumerate(detected):
+                with cols[i]:
+                    st.metric(f"🏷 {domain}", f"{score} 词匹配")
 
-    with st.expander("查看完整预览", expanded=False):
-        # 模拟组装一个预览
-        preview_parts = []
-        preview_parts.append(f"## Domain\n（自动识别，如：经济金融）")
-        preview_parts.append(f"## Target Audience\n{config.get('audience', 'Professional Readers')}")
-        preview_parts.append(f"## Style\n{config.get('style_name', selected_style)}")
-        preview_parts.append(f"## Terminology\n（术语表内容，如有）")
-        preview_parts.append(f"## Translation Memory\n（从记忆库检索到的相关句对，如有）")
-        preview_parts.append(f"## Style Examples\n（风格示例，如有）")
+        # ── 术语匹配 ──
+        terminology = load_app_terminology()
+        active_domains = [normalize_domain(d) for d in active_domains]
+        active_terms: list[tuple[str, str]] = []
+        for d in active_domains:
+            active_terms.extend(get_terms_for_domain(d, terminology))
 
-        principles = get_effective_principles(selected_style)
-        principles_lines = ["## Translation Principles"]
-        for i, p in enumerate(principles, 1):
-            principles_lines.append(f"{i}. {p}")
-        preview_parts.append("\n".join(principles_lines))
+        if active_terms:
+            matched_terms, match_positions = match_terms(test_text, active_terms)
 
-        preview_text = "\n\n".join(preview_parts)
-        st.code(preview_text, language="markdown")
+            st.divider()
+            st.markdown(f"### 📋 术语匹配 — 共 {len(matched_terms)} 个术语")
 
-    # ── 所有覆写一览 ────────────────────────────────────
-    st.divider()
-    st.markdown("### 📋 所有自定义提示词")
-    all_overrides = get_all_prompt_overrides()
-    if all_overrides:
-        for o in all_overrides:
-            tk = o["template_key"]
-            label = STYLE_LABELS.get(tk, tk)
-            st.caption(f"**{label}** — 更新于 {o['updated_at']}")
+            if matched_terms:
+                # 术语对照表
+                term_table_html = (
+                    "<table style='width:100%;border-collapse:collapse;font-size:14px;'>"
+                    "<tr style='background:#e0e0e0;'><th style='padding:8px;text-align:left;'>🇨🇳 中文</th><th style='padding:8px;text-align:left;'>🇬🇧 英文</th></tr>"
+                    + "".join(
+                        f"<tr style='border-bottom:1px solid #eee;'><td style='padding:8px;'>{ch}</td><td style='padding:8px;'>{en}</td></tr>"
+                        for ch, en in matched_terms
+                    )
+                    + "</table>"
+                )
+                st.markdown(term_table_html, unsafe_allow_html=True)
+            else:
+                st.info("未匹配到术语，可尝试手动补充")
+        else:
+            matched_terms = []
+            st.info("术语库为空或未覆盖该领域")
+
+        # ── 系统 Prompt 预览 ──
+        st.divider()
+        st.markdown("### 📝 系统 Prompt 预览")
+        st.caption("以下是翻译时自动生成的 System Prompt 结构：")
+
+        system_prompt = build_domain_prompt(
+            text=test_text,
+            domain=best_domain if best_domain != "其他" else None,
+            matched_terms=matched_terms if matched_terms else None,
+        )
+
+        with st.expander("查看完整 Prompt", expanded=True):
+            st.code(system_prompt, language="markdown")
+
     else:
-        st.caption("暂无自定义提示词，所有领域使用默认设置。")
+        st.info("👆 在上方输入文本，自动进行领域检测、术语匹配和 Prompt 生成")
+
+    # ── 术语库概况 ──
+    st.divider()
+    st.markdown("### 📊 术语库概况")
+
+    terminology = load_app_terminology()
+    if terminology:
+        total_terms = sum(len(v) for v in terminology.values())
+        cols = st.columns(len(terminology) + 1)
+        with cols[0]:
+            st.metric("📊 总术语", total_terms)
+        for i, (domain, terms) in enumerate(sorted(terminology.items())):
+            with cols[i + 1]:
+                st.metric(f"🏷 {domain}", len(terms))
+    else:
+        st.warning("未找到可用术语，请先在「术语库」上传 CSV 或检查静态术语文件路径")
+
+    # ── 领域语调一览 ──
+    st.divider()
+    st.markdown("### 🎨 领域语调配置")
+
+    for domain, tone in DOMAIN_TONES.items():
+        st.markdown(f"- **{domain}**：{tone}")
 
 # ── 规则发现弹窗（全局）──────────────────────────────
 if st.session_state.style_prompt:
     pd_data = st.session_state.style_prompt
     st.divider()
-    st.warning(f"🔍 **发现稳定修订模式**\n\n以下相同修改已出现 **{pd_data['count']} 次**：\n\n**before_text**\n> {pd_data['original']}\n\n**after_text**\n> {pd_data['modified']}\n\n句对已自动存入 **Memory Base**。")
+    st.warning(f"🔍 **发现稳定修订模式**\n\n以下相同修改已出现 **{pd_data['count']} 次**：\n\n**before_text**\n> {pd_data['original']}\n\n**after_text**\n> {pd_data['modified']}\n\n句对已自动存入 **术语库**。")
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
         if st.button("确认", type="primary", use_container_width=True): confirm_rule(pd_data["rule_id"]); st.session_state.style_prompt = None; st.success("已确认 🎉"); st.rerun()
