@@ -3,17 +3,191 @@
 import io
 import csv
 import inspect
+import re
+from pathlib import Path
 import streamlit as st
 from translator import translate, PROVIDER_LABELS, DIRECTION_LABELS
 from config import DEFAULT_PROVIDER
 from database import init_db
 from tracker import record_modification, confirm_rule, ignore_rule, defer_rule
 from document import parse_uploaded_file, filter_chinese_only, filter_english_only
-from term_manager import (
-    detect_domains, load_terminology,
-    get_terms_for_domain, match_terms,
-    build_domain_prompt, DOMAIN_KEYWORDS, DOMAIN_TONES,
-)
+
+# term_manager 是可选模块：本地有则优先使用；Streamlit Cloud 缺少该文件时启用内置兜底实现，
+# 避免 ModuleNotFoundError 直接导致网页无法启动。
+try:
+    from term_manager import (
+        detect_domains, load_terminology,
+        get_terms_for_domain, match_terms,
+        build_domain_prompt, DOMAIN_KEYWORDS, DOMAIN_TONES,
+    )
+    TERM_MANAGER_SOURCE = "term_manager.py"
+except ModuleNotFoundError:
+    TERM_MANAGER_SOURCE = "app.py 内置兜底"
+
+    DOMAIN_KEYWORDS = {
+        "医疗": [
+            "患者", "诊断", "治疗", "手术", "药物", "症状", "临床", "病理",
+            "医生", "护士", "医院", "病房", "处方", "剂量", "副作用", "康复",
+            "影像", "检验", "体检", "急诊", "发热", "头痛", "咳嗽", "炎症",
+            "麻醉", "切除", "移植", "疫苗", "感染", "肿瘤", "细胞", "血液",
+        ],
+        "法律": [
+            "合同", "法律", "诉讼", "判决", "仲裁", "条款", "违约", "原告",
+            "被告", "法院", "律师", "证据", "上诉", "赔偿", "知识产权", "专利",
+            "商标", "法人", "债权", "债务", "抵押", "担保", "管辖", "起诉",
+            "应诉", "调解", "裁定", "法条", "立法", "司法", "违法", "合法",
+        ],
+        "信息技术": [
+            "信息技术", "人工智能", "生成式人工智能", "大模型", "大语言模型",
+            "语义理解", "知识检索", "内容生成", "多轮对话", "逻辑推理",
+            "检索增强生成", "RAG", "幻觉", "代码", "数据", "数据库", "算法",
+            "接口", "前端", "后端", "云计算", "机器学习", "深度学习", "部署",
+            "调试", "网络", "软件", "硬件", "编程", "系统", "架构", "自动化",
+            "并发", "缓存", "容器", "微服务", "API", "SDK", "DevOps", "Python", "Java",
+        ],
+        "金融": [
+            "股票", "基金", "利率", "汇率", "资产", "负债", "利润", "现金流",
+            "分红", "贷款", "投资", "理财", "保险", "信用卡", "营收", "市盈率",
+            "K线", "牛市", "熊市", "通胀", "通缩", "央行", "降息", "加息",
+            "证券", "期货", "期权", "信托", "风投", "融资", "上市", "市值",
+        ],
+        "传统文化": ["儒家", "道家", "礼制", "诗词", "典故", "书法", "国画", "非遗", "民俗"],
+        "政治外交": ["外交", "主权", "双边", "多边", "公报", "倡议", "治理", "国际关系"],
+        "化学化工": ["反应", "催化", "溶液", "浓度", "化合物", "聚合", "萃取", "蒸馏"],
+        "教育": ["课程", "教学", "学习", "考试", "评价", "课堂", "教材", "培养方案"],
+    }
+
+    DOMAIN_TONES = {
+        "医疗": "极其严密、专业、中立，符合医学文献与临床手册规范，确保医学专有名词与诊疗表述准确",
+        "法律": "严谨、客观、高度程式化，确保条文、责任与权利义务表述清晰",
+        "信息技术": "简练、现代、注重逻辑，符合科技产品 UI、技术文档和开发者阅读习惯",
+        "金融": "专业、严谨，符合财经行业合规性与时效性，准确传达财务和市场逻辑",
+        "传统文化": "准确、雅正，保留文化负载词含义，必要时采用解释性翻译",
+        "政治外交": "正式、稳健、中立，符合政策文本和外交表述规范",
+        "化学化工": "精确、客观，符合化学化工专业文献表达",
+        "教育": "清晰、规范，符合教育教学和学术文本表达",
+        "其他": "专业、准确、自然，避免过度发挥",
+    }
+
+    def _candidate_terminology_paths() -> list[Path]:
+        here = Path(__file__).resolve().parent
+        return [
+            here / "terminology.csv",
+            here / "term_tool" / "terminology.csv",
+            Path.cwd() / "terminology.csv",
+            Path.cwd() / "term_tool" / "terminology.csv",
+        ]
+
+    def load_terminology(csv_path: str | None = None) -> dict[str, list[tuple[str, str]]]:
+        """读取静态 CSV 术语。找不到文件时返回空字典，不中断网页启动。"""
+        paths = [Path(csv_path)] if csv_path else _candidate_terminology_paths()
+        path = next((p for p in paths if p and p.exists()), None)
+        if path is None:
+            return {}
+
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = path.read_text(encoding="gbk", errors="replace")
+
+        terminology: dict[str, list[tuple[str, str]]] = {}
+        reader = csv.DictReader(io.StringIO(raw))
+        headers = reader.fieldnames or []
+
+        def pick(row: dict, *names: str) -> str:
+            for name in names:
+                if name in row and row[name] is not None:
+                    return str(row[name]).strip()
+            return ""
+
+        for row in reader:
+            source = pick(row, "中文术语", "中文", "source_text", "source", "zh", "cn")
+            target = pick(row, "英文术语", "英文", "target_text", "target", "en", "english")
+            domain = pick(row, "领域", "domain", "field", "category") or "其他"
+            if source and target:
+                terminology.setdefault(domain, []).append((source, target))
+        return terminology
+
+    def detect_domains(text: str, keywords: dict[str, list[str]]) -> list[tuple[str, int]]:
+        scores: dict[str, int] = {}
+        low_text = (text or "").lower()
+        for domain, kw_list in keywords.items():
+            score = 0
+            for kw in kw_list:
+                if not kw:
+                    continue
+                if re.search(r"[A-Za-z]", kw):
+                    if kw.lower() in low_text:
+                        score += 1
+                elif kw in text:
+                    score += 1
+            if score > 0:
+                scores[domain] = score
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    def get_terms_for_domain(domain: str, terminology: dict[str, list[tuple[str, str]]]) -> list[tuple[str, str]]:
+        if not domain:
+            return []
+        return list((terminology or {}).get(domain, []))
+
+    def _term_in_text(text: str, source: str, target: str) -> bool:
+        text = text or ""
+        low_text = text.lower()
+        source = source or ""
+        target = target or ""
+        if source and source in text:
+            return True
+        if target:
+            pattern = r"(?<![A-Za-z])" + re.escape(target.lower()) + r"s?(?![A-Za-z])"
+            if re.search(pattern, low_text):
+                return True
+        return False
+
+    def match_terms(text: str, terms: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[tuple[int, int, str, str]]]:
+        """返回命中的术语和位置。位置主要供兼容展示使用。"""
+        matched: list[tuple[str, str]] = []
+        positions: list[tuple[int, int, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for source, target in terms or []:
+            source = (source or "").strip()
+            target = (target or "").strip()
+            if not source or not target:
+                continue
+            if not _term_in_text(text, source, target):
+                continue
+            key = (source.lower(), target.lower())
+            if key not in seen:
+                matched.append((source, target))
+                seen.add(key)
+            idx = (text or "").find(source)
+            if idx >= 0:
+                positions.append((idx, idx + len(source), source, target))
+        return matched, positions
+
+    def build_domain_prompt(
+        text: str,
+        domain: str | None = None,
+        matched_terms: list[tuple[str, str]] | None = None,
+    ) -> str:
+        domain_name = domain or "通用"
+        tone = DOMAIN_TONES.get(domain or "其他", DOMAIN_TONES["其他"])
+        term_lines = "\n".join(f"  • {ch} → {en}" for ch, en in (matched_terms or []))
+        if not term_lines:
+            term_lines = "  （当前文本未命中术语库术语）"
+        return f"""# Role
+你是一位资深的{domain_name}领域翻译专家。
+
+# Style & Domain
+- 领域：{domain_name}
+- 语调：{tone}
+- 翻译必须忠实、准确、自然，避免自行扩写事实。
+
+# Terminology & Rules
+以下术语来自当前网页术语库；若原文出现对应概念，必须优先采用指定译法：
+{term_lines}
+
+# Task
+请基于以上领域、语调和术语要求翻译用户输入文本。""".strip()
 
 st.set_page_config(page_title="翻译记忆学习系统", page_icon="🌐", layout="wide")
 init_db()
