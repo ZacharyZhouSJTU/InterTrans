@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from openai import OpenAI
 from config import (
     OPENAI_API_KEY, OPENAI_MODEL,
     DEEPSEEK_API_KEY, DEEPSEEK_MODEL,
@@ -36,9 +35,22 @@ _deepseek_client = None
 _gemini_client = None
 
 
+def _require_openai_sdk():
+    """延迟导入 openai SDK，避免 app 启动阶段因依赖缺失而打不开网页。"""
+    try:
+        from openai import OpenAI
+        return OpenAI
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "缺少 openai SDK。请在 requirements.txt 中确认包含 openai>=1.0.0，"
+            "然后重新部署；本地可运行：pip install openai"
+        ) from exc
+
+
 def _get_openai_client():
     global _openai_client
     if _openai_client is None:
+        OpenAI = _require_openai_sdk()
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
 
@@ -46,6 +58,7 @@ def _get_openai_client():
 def _get_deepseek_client():
     global _deepseek_client
     if _deepseek_client is None:
+        OpenAI = _require_openai_sdk()
         _deepseek_client = OpenAI(
             api_key=DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com",
@@ -56,7 +69,13 @@ def _get_deepseek_client():
 def _get_gemini_client():
     global _gemini_client
     if _gemini_client is None:
-        import google.generativeai as genai
+        try:
+            import google.generativeai as genai
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "缺少 google-generativeai。请在 requirements.txt 中确认包含 "
+                "google-generativeai>=0.8.0，然后重新部署；本地可运行：pip install google-generativeai"
+            ) from exc
         genai.configure(api_key=GEMINI_API_KEY)
         _gemini_client = genai
     return _gemini_client

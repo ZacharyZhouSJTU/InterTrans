@@ -256,12 +256,20 @@ def filter_english_only(segments: list[dict]) -> list[dict]:
 #  Excel 导出（自动换行 + 自适应列宽）
 # ═══════════════════════════════════════════════════════════════
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment
-from openpyxl.utils import get_column_letter
-
-
 def export_to_xlsx(segments: list[dict], col_label: str = "Source Text") -> bytes:
+    """
+    导出 Excel。openpyxl 改为懒加载，避免部署环境缺少 openpyxl 时导致整个网页启动失败。
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment
+        from openpyxl.utils import get_column_letter
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "缺少 openpyxl。请在 requirements.txt 中确认包含 openpyxl>=3.0.0，"
+            "然后重新部署；本地可运行：pip install openpyxl"
+        ) from exc
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Sentences"
