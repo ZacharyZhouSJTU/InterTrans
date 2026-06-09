@@ -3,191 +3,210 @@
 import io
 import csv
 import inspect
-import re
-from pathlib import Path
 import streamlit as st
 from translator import translate, PROVIDER_LABELS, DIRECTION_LABELS
 from config import DEFAULT_PROVIDER
 from database import init_db
 from tracker import record_modification, confirm_rule, ignore_rule, defer_rule
 from document import parse_uploaded_file, filter_chinese_only, filter_english_only
-
-# term_manager 是可选模块：本地有则优先使用；Streamlit Cloud 缺少该文件时启用内置兜底实现，
-# 避免 ModuleNotFoundError 直接导致网页无法启动。
+# term_manager 是可选模块：有则使用；没有时启用内置兜底版，避免 Streamlit Cloud 直接 ModuleNotFoundError。
 try:
     from term_manager import (
         detect_domains, load_terminology,
         get_terms_for_domain, match_terms,
         build_domain_prompt, DOMAIN_KEYWORDS, DOMAIN_TONES,
     )
-    TERM_MANAGER_SOURCE = "term_manager.py"
-except ModuleNotFoundError:
-    TERM_MANAGER_SOURCE = "app.py 内置兜底"
+except Exception:
+    import json
+    from pathlib import Path
 
     DOMAIN_KEYWORDS = {
-        "医疗": [
-            "患者", "诊断", "治疗", "手术", "药物", "症状", "临床", "病理",
-            "医生", "护士", "医院", "病房", "处方", "剂量", "副作用", "康复",
-            "影像", "检验", "体检", "急诊", "发热", "头痛", "咳嗽", "炎症",
-            "麻醉", "切除", "移植", "疫苗", "感染", "肿瘤", "细胞", "血液",
-        ],
-        "法律": [
-            "合同", "法律", "诉讼", "判决", "仲裁", "条款", "违约", "原告",
-            "被告", "法院", "律师", "证据", "上诉", "赔偿", "知识产权", "专利",
-            "商标", "法人", "债权", "债务", "抵押", "担保", "管辖", "起诉",
-            "应诉", "调解", "裁定", "法条", "立法", "司法", "违法", "合法",
-        ],
         "信息技术": [
-            "信息技术", "人工智能", "生成式人工智能", "大模型", "大语言模型",
-            "语义理解", "知识检索", "内容生成", "多轮对话", "逻辑推理",
-            "检索增强生成", "RAG", "幻觉", "代码", "数据", "数据库", "算法",
-            "接口", "前端", "后端", "云计算", "机器学习", "深度学习", "部署",
-            "调试", "网络", "软件", "硬件", "编程", "系统", "架构", "自动化",
-            "并发", "缓存", "容器", "微服务", "API", "SDK", "DevOps", "Python", "Java",
+            "人工智能", "大模型", "大语言模型", "生成式", "算法", "数据", "代码",
+            "系统", "模型", "训练", "推理", "检索", "RAG", "LLM", "API", "NLP",
+            "prompt", "token", "embedding", "inference", "hallucination",
         ],
-        "金融": [
-            "股票", "基金", "利率", "汇率", "资产", "负债", "利润", "现金流",
-            "分红", "贷款", "投资", "理财", "保险", "信用卡", "营收", "市盈率",
-            "K线", "牛市", "熊市", "通胀", "通缩", "央行", "降息", "加息",
-            "证券", "期货", "期权", "信托", "风投", "融资", "上市", "市值",
-        ],
-        "传统文化": ["儒家", "道家", "礼制", "诗词", "典故", "书法", "国画", "非遗", "民俗"],
-        "政治外交": ["外交", "主权", "双边", "多边", "公报", "倡议", "治理", "国际关系"],
-        "化学化工": ["反应", "催化", "溶液", "浓度", "化合物", "聚合", "萃取", "蒸馏"],
-        "教育": ["课程", "教学", "学习", "考试", "评价", "课堂", "教材", "培养方案"],
+        "医疗": ["医疗", "医学", "临床", "患者", "诊断", "治疗", "药物", "疾病", "护理"],
+        "法律": ["法律", "合同", "法院", "诉讼", "仲裁", "条款", "责任", "权利", "义务"],
+        "金融": ["金融", "银行", "证券", "投资", "资产", "负债", "利率", "汇率", "风险"],
+        "传统文化": ["文化", "传统", "非遗", "民俗", "礼仪", "诗词", "书法", "节日"],
+        "政治外交": ["外交", "政治", "政府", "政策", "国际", "合作", "治理", "主权"],
+        "化学化工": ["化学", "化工", "反应", "催化", "溶液", "材料", "工艺", "分子"],
+        "教育": ["教育", "课程", "教学", "学习", "学生", "教师", "考试", "培养"],
+        "其他": [],
     }
 
     DOMAIN_TONES = {
-        "医疗": "极其严密、专业、中立，符合医学文献与临床手册规范，确保医学专有名词与诊疗表述准确",
-        "法律": "严谨、客观、高度程式化，确保条文、责任与权利义务表述清晰",
-        "信息技术": "简练、现代、注重逻辑，符合科技产品 UI、技术文档和开发者阅读习惯",
-        "金融": "专业、严谨，符合财经行业合规性与时效性，准确传达财务和市场逻辑",
-        "传统文化": "准确、雅正，保留文化负载词含义，必要时采用解释性翻译",
-        "政治外交": "正式、稳健、中立，符合政策文本和外交表述规范",
-        "化学化工": "精确、客观，符合化学化工专业文献表达",
-        "教育": "清晰、规范，符合教育教学和学术文本表达",
-        "其他": "专业、准确、自然，避免过度发挥",
+        "信息技术": "简练、现代、注重逻辑，符合科技产品 UI、技术文档及开发者阅读习惯",
+        "医疗": "准确、谨慎、专业，避免夸大疗效或改变医学含义",
+        "法律": "严谨、正式、保守，保持法律概念边界清晰",
+        "金融": "准确、客观、风险意识明确，符合财经文本表达",
+        "传统文化": "典雅、自然，保留文化意象并兼顾可理解性",
+        "政治外交": "正式、稳健、中性，避免口语化和过度解释",
+        "化学化工": "技术准确、单位和工艺表达规范",
+        "教育": "清晰、平实、符合教学与学术表达习惯",
+        "其他": "自然、准确、清晰",
     }
 
-    def _candidate_terminology_paths() -> list[Path]:
-        here = Path(__file__).resolve().parent
-        return [
-            here / "terminology.csv",
-            here / "term_tool" / "terminology.csv",
-            Path.cwd() / "terminology.csv",
-            Path.cwd() / "term_tool" / "terminology.csv",
-        ]
+    def _contains_chinese(value: str) -> bool:
+        return any("\u4e00" <= ch <= "\u9fff" for ch in str(value or ""))
 
-    def load_terminology(csv_path: str | None = None) -> dict[str, list[tuple[str, str]]]:
-        """读取静态 CSV 术语。找不到文件时返回空字典，不中断网页启动。"""
-        paths = [Path(csv_path)] if csv_path else _candidate_terminology_paths()
-        path = next((p for p in paths if p and p.exists()), None)
-        if path is None:
-            return {}
+    def _dedupe_term_pairs(terms):
+        seen = set()
+        out = []
+        for a, b in terms or []:
+            a = str(a or "").strip()
+            b = str(b or "").strip()
+            if not a or not b:
+                continue
+            key = (a.lower(), b.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((a, b))
+        return out
 
-        try:
-            raw = path.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            raw = path.read_text(encoding="gbk", errors="replace")
-
-        terminology: dict[str, list[tuple[str, str]]] = {}
-        reader = csv.DictReader(io.StringIO(raw))
-        headers = reader.fieldnames or []
-
-        def pick(row: dict, *names: str) -> str:
-            for name in names:
-                if name in row and row[name] is not None:
-                    return str(row[name]).strip()
-            return ""
-
-        for row in reader:
-            source = pick(row, "中文术语", "中文", "source_text", "source", "zh", "cn")
-            target = pick(row, "英文术语", "英文", "target_text", "target", "en", "english")
-            domain = pick(row, "领域", "domain", "field", "category") or "其他"
-            if source and target:
-                terminology.setdefault(domain, []).append((source, target))
-        return terminology
-
-    def detect_domains(text: str, keywords: dict[str, list[str]]) -> list[tuple[str, int]]:
-        scores: dict[str, int] = {}
-        low_text = (text or "").lower()
-        for domain, kw_list in keywords.items():
+    def detect_domains(text: str, domain_keywords: dict | None = None) -> list[tuple[str, int]]:
+        text_lower = str(text or "").lower()
+        keywords = domain_keywords or DOMAIN_KEYWORDS
+        scores = []
+        for domain, words in keywords.items():
             score = 0
-            for kw in kw_list:
-                if not kw:
+            for word in words:
+                w = str(word or "")
+                if not w:
                     continue
-                if re.search(r"[A-Za-z]", kw):
-                    if kw.lower() in low_text:
-                        score += 1
-                elif kw in text:
-                    score += 1
+                if _contains_chinese(w):
+                    score += str(text or "").count(w)
+                else:
+                    score += text_lower.count(w.lower())
             if score > 0:
-                scores[domain] = score
-        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                scores.append((domain, score))
+        return sorted(scores, key=lambda x: x[1], reverse=True)
 
-    def get_terms_for_domain(domain: str, terminology: dict[str, list[tuple[str, str]]]) -> list[tuple[str, str]]:
-        if not domain:
-            return []
+    def load_terminology() -> dict[str, list[tuple[str, str]]]:
+        """兜底读取术语：优先 terminology.csv；没有则读取 terminology.json。"""
+        base_dir = Path(__file__).resolve().parent
+        result: dict[str, list[tuple[str, str]]] = {}
+
+        csv_candidates = [
+            base_dir / "terminology.csv",
+            base_dir / "term_tool" / "terminology.csv",
+            base_dir / "data" / "terminology.csv",
+        ]
+        for path in csv_candidates:
+            if not path.exists():
+                continue
+            try:
+                import csv
+                with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                    rows = list(csv.reader(f))
+                if not rows:
+                    continue
+                header = [h.strip().lower() for h in rows[0]]
+                data_rows = rows[1:] if any(h in header for h in ["中文", "英文", "domain", "领域"]) else rows
+
+                def find_idx(names, default):
+                    for name in names:
+                        if name in header:
+                            return header.index(name)
+                    return default
+
+                zh_idx = find_idx(["中文", "chinese", "zh", "source", "source_text"], 0)
+                en_idx = find_idx(["英文", "english", "en", "target", "target_text"], 1)
+                dom_idx = None
+                for name in ["领域", "domain", "field", "category"]:
+                    if name in header:
+                        dom_idx = header.index(name)
+                        break
+
+                for row in data_rows:
+                    if len(row) <= max(zh_idx, en_idx):
+                        continue
+                    zh = row[zh_idx].strip()
+                    en = row[en_idx].strip()
+                    dom = row[dom_idx].strip() if dom_idx is not None and dom_idx < len(row) and row[dom_idx].strip() else "其他"
+                    if zh and en:
+                        result.setdefault(dom, []).append((zh, en))
+            except Exception:
+                continue
+
+        json_path = base_dir / "terminology.json"
+        if json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for src, tgt in data.items():
+                        src = str(src or "").strip()
+                        tgt = str(tgt or "").strip()
+                        if not src or not tgt:
+                            continue
+                        # terminology.json 原项目多为 英文 → 中文；app 内部统一为 中文 → English
+                        if _contains_chinese(src) and not _contains_chinese(tgt):
+                            pair = (src, tgt)
+                        elif _contains_chinese(tgt) and not _contains_chinese(src):
+                            pair = (tgt, src)
+                        else:
+                            pair = (src, tgt)
+                        result.setdefault("信息技术", []).append(pair)
+            except Exception:
+                pass
+
+        return {d: _dedupe_term_pairs(ts) for d, ts in result.items()}
+
+    def get_terms_for_domain(domain: str, terminology: dict) -> list[tuple[str, str]]:
         return list((terminology or {}).get(domain, []))
 
-    def _term_in_text(text: str, source: str, target: str) -> bool:
-        text = text or ""
-        low_text = text.lower()
-        source = source or ""
-        target = target or ""
-        if source and source in text:
-            return True
-        if target:
-            pattern = r"(?<![A-Za-z])" + re.escape(target.lower()) + r"s?(?![A-Za-z])"
-            if re.search(pattern, low_text):
-                return True
-        return False
-
-    def match_terms(text: str, terms: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[tuple[int, int, str, str]]]:
-        """返回命中的术语和位置。位置主要供兼容展示使用。"""
-        matched: list[tuple[str, str]] = []
-        positions: list[tuple[int, int, str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for source, target in terms or []:
-            source = (source or "").strip()
-            target = (target or "").strip()
-            if not source or not target:
-                continue
-            if not _term_in_text(text, source, target):
-                continue
-            key = (source.lower(), target.lower())
-            if key not in seen:
-                matched.append((source, target))
-                seen.add(key)
-            idx = (text or "").find(source)
-            if idx >= 0:
-                positions.append((idx, idx + len(source), source, target))
+    def match_terms(text: str, terms: list[tuple[str, str]]):
+        text = str(text or "")
+        text_lower = text.lower()
+        matched = []
+        positions = []
+        for zh, en in sorted(_dedupe_term_pairs(terms), key=lambda p: max(len(p[0]), len(p[1])), reverse=True):
+            hit_pos = None
+            hit_len = 0
+            for cand in (zh, en):
+                if not cand:
+                    continue
+                if _contains_chinese(cand):
+                    pos = text.find(cand)
+                else:
+                    pos = text_lower.find(cand.lower())
+                if pos >= 0:
+                    hit_pos = pos
+                    hit_len = len(cand)
+                    break
+            if hit_pos is not None:
+                matched.append((zh, en))
+                positions.append((hit_pos, hit_pos + hit_len, zh, en))
         return matched, positions
 
-    def build_domain_prompt(
-        text: str,
-        domain: str | None = None,
-        matched_terms: list[tuple[str, str]] | None = None,
-    ) -> str:
-        domain_name = domain or "通用"
-        tone = DOMAIN_TONES.get(domain or "其他", DOMAIN_TONES["其他"])
-        term_lines = "\n".join(f"  • {ch} → {en}" for ch, en in (matched_terms or []))
-        if not term_lines:
-            term_lines = "  （当前文本未命中术语库术语）"
-        return f"""# Role
-你是一位资深的{domain_name}领域翻译专家。
+    def build_domain_prompt(text: str, domain: str | None = None, matched_terms: list[tuple[str, str]] | None = None) -> str:
+        actual_domain = domain or "其他"
+        tone = DOMAIN_TONES.get(actual_domain, DOMAIN_TONES["其他"])
+        lines = [
+            "# Role",
+            f"你是一位资深的{actual_domain}领域翻译专家。",
+            "",
+            "# Style",
+            tone,
+            "",
+            "# Core Requirements",
+            "- 忠实传达原文含义，不增译、不漏译关键信息。",
+            "- 保持术语、数字、专名、缩写和单位一致。",
+            "- 输出译文即可，除非用户另有要求，不要解释。",
+        ]
+        if matched_terms:
+            lines.extend([
+                "",
+                "# Terminology & Rules",
+                "以下术语来自当前术语库，并且已在待翻译文本中命中；翻译时必须优先采用：",
+            ])
+            for zh, en in matched_terms:
+                lines.append(f"- {zh} → {en}")
+        return "\n".join(lines)
 
-# Style & Domain
-- 领域：{domain_name}
-- 语调：{tone}
-- 翻译必须忠实、准确、自然，避免自行扩写事实。
-
-# Terminology & Rules
-以下术语来自当前网页术语库；若原文出现对应概念，必须优先采用指定译法：
-{term_lines}
-
-# Task
-请基于以上领域、语调和术语要求翻译用户输入文本。""".strip()
 
 st.set_page_config(page_title="翻译记忆学习系统", page_icon="🌐", layout="wide")
 init_db()
@@ -468,8 +487,18 @@ with tab1:
                 try:
                     st.session_state.segments = parse_uploaded_file(uploaded_file)
                     from database import add_file_history
-                    add_file_history(uploaded_file.name, len(st.session_state.segments))
-                    st.success(f"解析完成！共 {len(st.session_state.segments)} 个句子")
+                    seg_count = len(st.session_state.segments)
+                    add_file_history(uploaded_file.name, seg_count)
+                    if seg_count == 0:
+                        file_size = getattr(uploaded_file, "size", None)
+                        size_hint = f"，文件大小约 {file_size} bytes" if file_size is not None else ""
+                        st.warning(
+                            f"解析完成，但没有提取到可翻译文本（0 个句子{size_hint}）。"
+                            "常见原因：文档内容是扫描图片/OCR 图片、Word 中为特殊文本框/嵌入对象、"
+                            "或原解析器未覆盖表格结构。请确认已更新 document.py；若仍为 0，建议先另存为 .docx 或 .txt 后重试。"
+                        )
+                    else:
+                        st.success(f"解析完成！共 {seg_count} 个句子")
                 except Exception as e:
                     st.error(f"解析失败：{e}")
                     st.session_state.segments = []
